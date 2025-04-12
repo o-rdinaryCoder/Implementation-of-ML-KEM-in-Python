@@ -1,107 +1,123 @@
-import os
-import hashlib
-import secrets
 import numpy as np
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
+import secrets
+import hashlib
 
-# Placeholder for ML-KEM parameters (replace with actual values)
-N = 256  # Example: Polynomial ring dimension
-Q = 65537  # Example: Modulus
-ETA = 3  # Example: Noise parameter
-D = 16  # Example: Number of NTT coefficients per polynomial
-K = 256  # Example: Key size in bits
-SEED_BYTES = 32
-PUBLICKEY_BYTES = 12 * N // 8
-CIPHERTEXT_BYTES = 12 * N // 8
-SHARED_SECRET_BYTES = 32
+# Parameters
+N = 4  # Polynomial degree
+Q = 3329  # A prime modulus
+K = 2  # Matrix dimension
 
-def sample_uniform(q):  # Corrected function signature
-    """Samples a uniform random integer in [0, q)."""
-    return secrets.randbelow(q)
+def poly_add(a, b):
+    """Add two polynomials modulo Q."""
+    return [(x + y) % Q for x, y in zip(a, b)]
 
-def sample_gaussian(eta):
-    """Samples a Gaussian integer with mean 0 and standard deviation eta."""
-    # Placeholder: Replace with an efficient Gaussian sampling algorithm
-    return np.random.normal(0, eta)
+def poly_sub(a, b):
+    """Subtract two polynomials modulo Q."""
+    return [(x - y) % Q for x, y in zip(a, b)]
 
-def ntt(a, q):
-    """Number Theoretic Transform (NTT)."""
-    # Placeholder: Replace with an efficient NTT implementation
-    # This example uses a very basic (and slow) implementation.
-    n = len(a)
-    if n == 1:
-        return a
-    else:
-        even = ntt(a[0::2], q)
-        odd = ntt(a[1::2], q)
-        T = [pow(2, i * (q - 1) // (2 * n), q) for i in range(n // 2)]
-        return [(even[i] + T[i] * odd[i]) % q for i in range(n // 2)] + \
-               [(even[i] - T[i] * odd[i]) % q for i in range(n // 2)]
+def poly_mul(a, b):
+    """Multiply two polynomials modulo X^N + 1 and Q."""
+    res = [0] * (2 * N - 1)
+    for i in range(N):
+        for j in range(N):
+            res[i + j] += a[i] * b[j]
+    # Reduce mod X^N + 1
+    for i in range(N, 2 * N - 1):
+        res[i - N] = (res[i - N] - res[i]) % Q
+    return [x % Q for x in res[:N]]
 
-def inverse_ntt(a, q):
-    """Inverse Number Theoretic Transform (INTT)."""
-    # Placeholder: Replace with an efficient INTT implementation
-    n = len(a)
-    if n == 1:
-        return a
-    else:
-        even = inverse_ntt(a[0::2], q)
-        odd = inverse_ntt(a[1::2], q)
-        T = [pow(2, -i * (q - 1) // (2 * n), q) for i in range(n // 2)]
-        result = [(even[i] + T[i] * odd[i]) % q for i in range(n // 2)] + \
-                 [(even[i] - T[i] * odd[i]) % q for i in range(n // 2)]
-        inv_n = pow(n, q - 2, q)
-        return [(x * inv_n) % q for x in result]
+def gen_poly():
+    """Generate a random polynomial with very small coefficients."""
+    return [secrets.randbelow(3) - 1 for _ in range(N)]  # Coefficients in {-1, 0, 1}
 
-def polynomial_mul(a, b, q):
-    """Polynomial multiplication using NTT."""
-    a_ntt = ntt(a, q)
-    b_ntt = ntt(b, q)
-    c_ntt = [(a_ntt[i] * b_ntt[i]) % q for i in range(len(a))]
-    return inverse_ntt(c_ntt, q)
+def gen_matrix(k):
+    """Generate a random k x k matrix of polynomials."""
+    return [[gen_poly() for _ in range(k)] for _ in range(k)]
+
+def transpose_matrix(matrix):
+    """Transpose a matrix."""
+    return [list(row) for row in zip(*matrix)]
+
+def matrix_vector_mul(matrix, vector):
+    """Multiply a matrix by a vector of polynomials."""
+    result = []
+    for row in matrix:
+        acc = [0] * N
+        for i in range(len(row)):
+            acc = poly_add(acc, poly_mul(row[i], vector[i]))
+        result.append(acc)
+    return result
+
+def compress(poly, q=Q):
+    """Compress polynomial coefficients to 1 bit (mimicking Kyber's compression)."""
+    # Map coefficients to {0, 1} based on proximity to Q/2
+    return [1 if (coeff % q) > q // 4 and (coeff % q) < 3 * q // 4 else 0 for coeff in poly]
+
+def encode(poly_vec):
+    """Encode a polynomial vector to a shared secret using SHA3-256."""
+    flat = sum(poly_vec, [])
+    # Compress coefficients to reduce sensitivity to errors
+    compressed = compress(flat)
+    # Convert to bytes
+    byte_array = bytearray(compressed)
+    h = hashlib.sha3_256(byte_array).digest()
+    return h
 
 def generate_keypair():
-    """Generates a public/private key pair."""
-    s = [sample_gaussian(ETA) for _ in range(N)]
-    A = [[sample_uniform(Q) for _ in range(N)] for _ in range(N)] #Corrected line
-    b = [sum((A[i][j] * s[j]) for j in range(N)) % Q for i in range(N)]
+    """Generate a keypair for public key encryption."""
+    A = gen_matrix(K)
+    s = [gen_poly() for _ in range(K)]  # Secret vector
+    e = [gen_poly() for _ in range(K)]  # Error vector
+
+    b = matrix_vector_mul(A, s)
+    b = [poly_add(b[i], e[i]) for i in range(K)]  # b = A * s + e
+
     public_key = (A, b)
     private_key = s
     return public_key, private_key
 
 def encapsulate(public_key):
-    """Encapsulates a shared secret."""
+    """Encapsulate a shared secret using the public key."""
     A, b = public_key
-    r = [sample_gaussian(ETA) for _ in range(N)]
-    u = [sum((A[j][i] * r[i]) for i in range(N)) % Q for j in range(N)]
-    v = (sum((b[i] * r[i]) for i in range(N)))%Q
-    k = os.urandom(SHARED_SECRET_BYTES)
-    ciphertext = u, v
-    return ciphertext, k
+    r = [gen_poly() for _ in range(K)]
+    e1 = [gen_poly() for _ in range(K)]
+    e2 = gen_poly()
+
+    u = matrix_vector_mul(transpose_matrix(A), r)
+    u = [poly_add(u[i], e1[i]) for i in range(K)]
+
+    # Sum polynomials for v
+    v = [0] * N
+    for i in range(K):
+        v = poly_add(v, poly_mul(b[i], r[i]))
+    v = poly_add(v, e2)
+
+    shared_secret = encode([v])
+
+    return (u, v), shared_secret
 
 def decapsulate(ciphertext, private_key):
-    """Decapsulates a shared secret."""
+    """Decapsulate the shared secret using the private key."""
     u, v = ciphertext
     s = private_key
-    v_prime = (v - sum((u[i] * s[i]) for i in range(N))) % Q
-    k = os.urandom(SHARED_SECRET_BYTES) #in real code, this would be computed, but placeholder
-    return k
 
-def kem_encapsulate(public_key):
-    """KEM encapsulation."""
-    ciphertext, shared_secret = encapsulate(public_key)
-    return ciphertext, shared_secret
+    # v - u * s
+    us = [0] * N
+    for i in range(K):
+        us = poly_add(us, poly_mul(u[i], s[i]))
 
-def kem_decapsulate(ciphertext, private_key):
-    """KEM decapsulation."""
-    shared_secret = decapsulate(ciphertext, private_key)
+    m = poly_sub(v, us)  # v - u * s
+
+    shared_secret = encode([m])
+
     return shared_secret
 
-# Example usage (replace with actual parameter values and secure implementations)
+# Demo
+print("=== ML-KEM-Like Key Encapsulation Simulation ===")
 public_key, private_key = generate_keypair()
-ciphertext, shared_secret_encap = kem_encapsulate(public_key)
-shared_secret_decap = kem_decapsulate(ciphertext, private_key)
+ciphertext, shared_enc = encapsulate(public_key)
+shared_dec = decapsulate(ciphertext, private_key)
 
-print(f"Encapsulated shared secret: {shared_secret_encap.hex()}")
-print(f"Decapsulated shared secret: {shared_secret_decap.hex()}")
+print(f"\nEncapsulated Shared Secret: {shared_enc.hex()}")
+print(f"Decapsulated Shared Secret: {shared_dec.hex()}")
+print("Match:", shared_enc == shared_dec)
